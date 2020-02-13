@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"os"
 	"path/filepath"
@@ -21,6 +23,7 @@ type Arguments struct {
 }
 
 func main() {
+	// parse flags
 	_, err := flags.Parse(&args)
 	if flags.WroteHelp(err) {
 		os.Exit(0)
@@ -28,49 +31,30 @@ func main() {
 		panic(err)
 	}
 
+	args.DryRun = true
+
+	// figure out target directory, assume current directory if no argument is passed in
 	baseDir := `.`
 	if len(args.Pos.BaseDir) != 0 {
 		baseDir = args.Pos.BaseDir
 	}
 
-	folders := getSubDirs(baseDir)
+	// get all sub directories
+	folders := []string{baseDir}
 	for i := 0; i < len(folders); i++ {
 		subs := getSubDirs(folders[i])
 		folders = append(folders, subs...)
 	}
 
+	// filter sub directories
 	for i := 0; i < len(folders); i++ {
-		if !args.Unstub && !validFolder(folders[i]) {
-			folders = append(folders[:i], folders[i+1:]...)
-			i--
-		} else if args.Unstub && !hasXTest(folders[i]) {
+		if (args.Unstub && !hasXTest(folders[i])) || (!args.Unstub && !validFolder(folders[i])) {
 			folders = append(folders[:i], folders[i+1:]...)
 			i--
 		}
 	}
 
-	if !args.Unstub && validFolder(baseDir) {
-		filename := filepath.Join(baseDir, "x_test.go")
-		if args.DryRun {
-			fmt.Printf("create %s\n", filename)
-		} else {
-			err := ioutil.WriteFile(filename, []byte("package main\n"), 0666)
-			if err != nil {
-				fmt.Printf("unable to write %s: %+v", filename, err)
-			}
-		}
-	} else if args.Unstub {
-		filename := filepath.Join(baseDir, "x_test.go")
-		if args.DryRun {
-			fmt.Printf("delete %s\n", filename)
-		} else {
-			err := os.Remove(filename)
-			if err != nil {
-				fmt.Printf("unable to delete %s: %+v", filename, err)
-			}
-		}
-	}
-
+	// iterate folders stubbing or unstubbing
 	for _, f := range folders {
 		filename := filepath.Join(f, "x_test.go")
 		if args.Unstub {
@@ -83,10 +67,11 @@ func main() {
 				}
 			}
 		} else {
+			pkg := getPackageFromFolder(f)
 			if args.DryRun {
-				fmt.Printf("create %s\n", filename)
+				fmt.Printf("create %s with package %s\n", filename, pkg)
 			} else {
-				pkg := "package " + filepath.Base(f)
+				pkg := "package " + pkg
 				err := ioutil.WriteFile(filename, []byte(pkg), 0666)
 				if err != nil {
 					fmt.Printf("unable to write %s: %+v", filename, err)
@@ -98,7 +83,6 @@ func main() {
 
 func validFolder(dir string) (valid bool) {
 	containsGoFiles := false
-	containsTestFiles := false
 
 	files, err := ioutil.ReadDir(dir)
 	if err != nil {
@@ -106,20 +90,27 @@ func validFolder(dir string) (valid bool) {
 	}
 
 	for _, f := range files {
+		if f.IsDir() {
+			continue
+		}
+
 		filename := strings.ToUpper(f.Name())
 		if strings.HasSuffix(filename, ".GO") {
 			containsGoFiles = true
 		}
 
 		if strings.HasSuffix(filename, "_TEST.GO") {
-			containsTestFiles = true
+			// found a test file, nothing else matters,
+			// we don't want to touch this folder
+			return false
 		}
 	}
 
-	return containsGoFiles && !containsTestFiles
+	return containsGoFiles
 }
 
 func hasXTest(dir string) (has bool) {
+	// determines if a folder has a x_test.go file already in it
 	files, err := ioutil.ReadDir(dir)
 	if err != nil {
 		panic(err)
@@ -134,6 +125,69 @@ func hasXTest(dir string) (has bool) {
 	return false
 }
 
+func getPackageFromFolder(dir string) (pkg string) {
+	files, err := ioutil.ReadDir(dir)
+	if err != nil {
+		panic(err)
+	}
+
+	pkgs := map[string]int{} // keeps track of how many times a pkg is seen
+	for _, f := range files {
+		F := strings.ToUpper(f.Name())
+		if f.IsDir() || !strings.HasSuffix(F, ".GO") || strings.HasSuffix(F, "_TEST.GO") {
+			continue
+		}
+		pkg := getPackageFromSource(filepath.Join(dir, f.Name()))
+		pkgs[pkg]++
+	}
+
+	// determine which package was seen the most
+	most := ""
+	for k, v := range pkgs {
+		if v > pkgs[most] {
+			most = k
+		}
+	}
+
+	return most
+}
+
+func getPackageFromSource(path string) (pkg string) {
+	f, err := os.Open(path)
+	if err != nil {
+		fmt.Printf("unable to retrieve package from %s: %+v", path, err)
+
+		return ""
+	}
+
+	r := bufio.NewReader(f)
+
+	var line string
+
+	for err != io.EOF {
+		// read a line
+		line, err = r.ReadString('\n')
+		if err != nil {
+			fmt.Printf("unable to read from %s: %+v\n", path, err)
+			return ""
+		}
+
+		// remove any comments
+		commentStart := strings.Index(line, "//")
+		if commentStart >= 0 {
+			line = line[:commentStart]
+		}
+
+		// check for package
+		if strings.HasPrefix(line, "package ") {
+			// found the package, done!
+			return strings.TrimSpace(strings.TrimPrefix(line, "package "))
+		}
+	}
+
+	return ""
+}
+
 func getSubDirs(dir string) (subs []string) {
 	files, err := ioutil.ReadDir(dir)
 	if err != nil {
@@ -142,6 +196,7 @@ func getSubDirs(dir string) (subs []string) {
 
 	for _, f := range files {
 		absPath := filepath.Join(dir, f.Name())
+		// filter to only dirs, no dot dirs (i.e. .git), and no duplicates (might happen with symlinked folders)
 		if f.IsDir() && f.Name()[0] != '.' && !contains(subs, absPath) {
 			subs = append(subs, absPath)
 		}
